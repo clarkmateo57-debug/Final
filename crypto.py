@@ -1,6 +1,7 @@
 import streamlit as st
 import random
 import time
+import requests
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -263,6 +264,23 @@ canvas {
 """, unsafe_allow_html=True)
 
 # =========================
+# Live data source (Binance REST)
+# =========================
+
+def fetch_live_price(symbol: str) -> Optional[float]:
+    """
+    Fetch real-time crypto price from Binance via REST.
+    Example symbol: 'BTCUSDT', 'ETHUSDT', etc.
+    """
+    try:
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+        r = requests.get(url, timeout=2)
+        data = r.json()
+        return float(data["price"])
+    except Exception:
+        return None
+
+# =========================
 # Engine data structures
 # =========================
 
@@ -281,6 +299,7 @@ class Position:
     contracts: int = 0
     side: Optional[str] = None  # "LONG", "SHORT", or None
     entry: float = 0.0
+    entry_time: Optional[str] = None
 
 @dataclass
 class Order:
@@ -303,14 +322,28 @@ class Trade:
     timestamp_open: str
     timestamp_close: str
 
+# Default 6 live markets (Binance symbols)
 INITIAL_MARKETS: List[Market] = [
-    Market("Crude Oil (CL)", "CL", 72.50, 0.025, 0.001),
-    Market("Gold (GC)", "GC", 2050.00, 0.015, 0.0005),
-    Market("S&P 500 (ES)", "ES", 4780.00, 0.018, 0.0008),
-    Market("EUR/USD (EC)", "EC", 1.0950, 0.012, -0.0003),
-    Market("Treasury (ZN)", "ZN", 110.50, 0.01, -0.0002),
-    Market("Natural Gas (NG)", "NG", 2.85, 0.035, 0.002),
+    Market("Bitcoin (BTC)", "BTCUSDT", 0.0, 0.02, 0.0005),
+    Market("Ethereum (ETH)", "ETHUSDT", 0.0, 0.025, 0.0007),
+    Market("Solana (SOL)", "SOLUSDT", 0.0, 0.03, 0.0010),
+    Market("BNB (BNB)", "BNBUSDT", 0.0, 0.02, 0.0004),
+    Market("XRP (XRP)", "XRPUSDT", 0.0, 0.03, 0.0003),
+    Market("Dogecoin (DOGE)", "DOGEUSDT", 0.0, 0.05, 0.0020),
 ]
+
+# =========================
+# Strategy parameter defaults (session-safe)
+# =========================
+
+if "fast_ma" not in st.session_state:
+    st.session_state.fast_ma = 10
+if "slow_ma" not in st.session_state:
+    st.session_state.slow_ma = 30
+if "atr_period" not in st.session_state:
+    st.session_state.atr_period = 14
+if "risk_per_trade" not in st.session_state:
+    st.session_state.risk_per_trade = 2.0
 
 # =========================
 # Engine initialization
@@ -318,15 +351,21 @@ INITIAL_MARKETS: List[Market] = [
 
 def init_engine_state(state):
     if "markets" not in state:
-        state.markets = [Market(**m.__dict__) for m in INITIAL_MARKETS]
+        markets = []
+        for m in INITIAL_MARKETS:
+            live_price = fetch_live_price(m.symbol)
+            price = live_price if live_price is not None else 100.0
+            markets.append(Market(m.name, m.symbol, price, m.volatility, m.trend))
+        state.markets = markets
 
     if "price_history" not in state:
         state.price_history: Dict[str, List[float]] = {}
         for m in state.markets:
             prices = []
+            base_price = m.price if m.price > 0 else 100.0
             for _ in range(100):
                 shock = (random.random() - 0.5) * m.volatility * 0.5
-                prices.append(m.price * (1 + shock))
+                prices.append(base_price * (1 + shock))
             state.price_history[m.symbol] = prices
 
     if "positions" not in state:
@@ -400,10 +439,9 @@ def execute_order(state, market: Market, side: str, contracts: int, reason: str)
 
     pos = state.positions[market.symbol]
 
-    # trade logging on CLOSE
     if side == "CLOSE" and pos.side is not None and pos.contracts > 0:
         direction = 1 if pos.side == "LONG" else -1
-        pnl = direction * (market.price - pos.entry) * pos.contracts * 100.0
+        pnl = direction * (market.price - pos.entry) * pos.contracts
         trade = Trade(
             symbol=market.symbol,
             side=pos.side,
@@ -411,20 +449,18 @@ def execute_order(state, market: Market, side: str, contracts: int, reason: str)
             exit=market.price,
             contracts=pos.contracts,
             pnl=pnl,
-            timestamp_open=pos.entry_time if hasattr(pos, "entry_time") else "",
+            timestamp_open=pos.entry_time or "",
             timestamp_close=timestamp
         )
         state.trades.append(trade)
         state.positions[market.symbol] = Position()
     elif side in ("LONG", "SHORT"):
-        # opening / flipping position
-        new_pos = Position(
+        state.positions[market.symbol] = Position(
             contracts=contracts,
             side=side,
             entry=market.price,
+            entry_time=timestamp
         )
-        new_pos.entry_time = timestamp
-        state.positions[market.symbol] = new_pos
 
 def update_equity_from_positions(state):
     last_equity = state.equity[-1]
@@ -434,23 +470,32 @@ def update_equity_from_positions(state):
         if pos.contracts == 0 or pos.side is None:
             continue
         direction = 1 if pos.side == "LONG" else -1
-        pnl_open += direction * (m.price - pos.entry) * pos.contracts * 100.0
+        pnl_open += direction * (m.price - pos.entry) * pos.contracts
     state.equity.append(last_equity + pnl_open)
 
 # =========================
-# One simulation step
+# One simulation step (live data)
 # =========================
 
 def simulate_step(state):
-    # price evolution (synthetic)
+    # price evolution using live Binance prices with synthetic fallback
     for i, m in enumerate(state.markets):
         prices = state.price_history[m.symbol]
         last_price = prices[-1]
-        random_shock = (random.random() - 0.5) * m.volatility
-        noise = random.uniform(-1, 1) * m.volatility * 0.3
-        new_price = last_price * (1 + random_shock + m.trend + noise)
+
+        live_price = fetch_live_price(m.symbol)
+        if live_price is not None and live_price > 0:
+            new_price = live_price
+        else:
+            random_shock = (random.random() - 0.5) * m.volatility
+            noise = random.uniform(-1, 1) * m.volatility * 0.3
+            new_price = last_price * (1 + random_shock + m.trend + noise)
+
         state.markets[i].price = new_price
         state.price_history[m.symbol].append(new_price)
+
+        if len(state.price_history[m.symbol]) > 1000:
+            state.price_history[m.symbol] = state.price_history[m.symbol][-1000:]
 
     # strategy per market
     for m in state.markets:
@@ -470,7 +515,7 @@ def simulate_step(state):
         pos = state.positions[m.symbol]
         equity_now = state.equity[-1]
         risk_amount = equity_now * (st.session_state.risk_per_trade / 100.0)
-        contracts = max(1, int(risk_amount / max(atr * 100.0, 1e-6)))
+        contracts = max(1, int(risk_amount / max(atr, 1e-6)))
 
         current_price = prices[-1]
         trend_signal = 1 if fast > slow else -1
@@ -502,7 +547,8 @@ def simulate_step(state):
                 reason = "Exit Short - Signal Reversal"
 
         if side is not None:
-            execute_order(state, m, side, contracts if side != "CLOSE" else pos.contracts, reason)
+            size = contracts if side != "CLOSE" else pos.contracts
+            execute_order(state, m, side, size, reason)
 
     update_equity_from_positions(state)
 
@@ -528,7 +574,6 @@ def compute_performance(state):
     avg_pnl = sum(pnls) / total_trades
     total_pnl = sum(pnls)
 
-    # max drawdown from equity curve
     equity = state.equity
     max_equity = equity[0]
     max_dd = 0.0
@@ -553,22 +598,20 @@ def compute_performance(state):
 
 st.sidebar.header("⚙️ Engine & Strategy")
 
-# strategy params
-st.session_state.fast_ma = st.sidebar.slider("Fast MA", 5, 50, 10, 1)
-st.session_state.slow_ma = st.sidebar.slider("Slow MA", 10, 200, 30, 5)
-st.session_state.atr_period = st.sidebar.slider("ATR Period", 5, 50, 14, 1)
-st.session_state.risk_per_trade = st.sidebar.slider("Risk per Trade (%)", 0.5, 5.0, 2.0, 0.5)
+st.session_state.fast_ma = st.sidebar.slider("Fast MA", 5, 50, st.session_state.fast_ma, 1)
+st.session_state.slow_ma = st.sidebar.slider("Slow MA", 10, 200, st.session_state.slow_ma, 5)
+st.session_state.atr_period = st.sidebar.slider("ATR Period", 5, 50, st.session_state.atr_period, 1)
+st.session_state.risk_per_trade = st.sidebar.slider("Risk per Trade (%)", 0.5, 5.0, st.session_state.risk_per_trade, 0.5)
 
-# auto-run
-auto = st.sidebar.checkbox("Auto‑Run Engine", value=False)
+auto = st.sidebar.checkbox("Auto‑Run Engine", value=st.session_state.get("auto_run", False))
 st.session_state.auto_run = auto
 
 delay = st.sidebar.slider(
     "Auto‑Run Speed (seconds per step)",
-    min_value=0.05,
-    max_value=1.0,
-    value=0.5,
-    step=0.05
+    min_value=0.1,
+    max_value=2.0,
+    value=st.session_state.get("auto_run_delay", 0.5),
+    step=0.1
 )
 st.session_state.auto_run_delay = delay
 
@@ -576,9 +619,10 @@ batch_steps = st.sidebar.number_input(
     "Batch Steps",
     min_value=1,
     max_value=1000,
-    value=100,
+    value=st.session_state.get("batch_steps", 100),
     step=50
 )
+st.session_state.batch_steps = batch_steps
 
 if st.sidebar.button("Run Batch"):
     init_engine_state(st.session_state)
@@ -614,22 +658,20 @@ def autorun_engine():
 
 st.markdown('<div class="container">', unsafe_allow_html=True)
 
-# Header
 st.markdown("""
 <div class="header">
     <h1>⚡ Live CTA Trading System</h1>
-    <p>Real-time futures trading with predictive analytics (simulated feed)</p>
+    <p>Real-time crypto trading engine on Binance prices (simulation only, no real orders)</p>
 </div>
 """, unsafe_allow_html=True)
 
-# Status bar
 status_left, status_right = st.columns([3, 1])
 with status_left:
     st.markdown("""
     <div class="status-bar">
         <div class="status-indicator">
             <div class="live-dot"></div>
-            <span><strong>LIVE SIMULATION</strong> - Engine running in Python</span>
+            <span><strong>LIVE CRYPTO DATA (Binance REST)</strong> - Engine running in Python</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -639,7 +681,6 @@ with status_right:
         unsafe_allow_html=True
     )
 
-# Manual controls
 c1, c2 = st.columns(2)
 with c1:
     if st.button("Run 1 step"):
@@ -649,7 +690,6 @@ with c2:
         for _ in range(20):
             simulate_step(st.session_state)
 
-# Grid 1: markets + orders
 left1, right1 = st.columns([2, 1])
 
 with left1:
@@ -666,26 +706,32 @@ with left1:
         pos_color = "#10b981" if pos.side == "LONG" else "#ef4444" if pos.side == "SHORT" else "#94a3b8"
         pos_text = f"{pos.side} {pos.contracts}" if pos.contracts > 0 else "FLAT"
 
+        fast_val = calculate_ma(prices, st.session_state.fast_ma)
+        slow_val = calculate_ma(prices, st.session_state.slow_ma)
+        fast_str = f"{fast_val:.2f}" if fast_val is not None else "-"
+        slow_str = f"{slow_val:.2f}" if slow_val is not None else "-"
+        momentum_str = f"{(m.momentum * 100):.2f}%" if m.momentum is not None else "-"
+
         st.markdown(f"""
         <div class="market-item">
             <div class="market-header">
-                <div class="market-name">{m.name}</div>
+                <div class="market-name">{m.name} ({m.symbol})</div>
                 <div class="market-price {direction_class}">
-                    ${last:.2f} {'▲' if change >= 0 else '▼'} {abs(change_pct):.2f}%
+                    ${last:.4f} {'▲' if change >= 0 else '▼'} {abs(change_pct):.2f}%
                 </div>
             </div>
             <div class="market-details">
                 <div class="detail-item">
-                    <span class="label">Fast MA:</span><span>{calculate_ma(prices, st.session_state.fast_ma) or '-':}</span>
+                    <span class="label">Fast MA:</span><span>{fast_str}</span>
                 </div>
                 <div class="detail-item">
-                    <span class="label">Slow MA:</span><span>{calculate_ma(prices, st.session_state.slow_ma) or '-':}</span>
+                    <span class="label">Slow MA:</span><span>{slow_str}</span>
                 </div>
                 <div class="detail-item">
                     <span class="label">Position:</span><span style="color:{pos_color}">{pos_text}</span>
                 </div>
                 <div class="detail-item">
-                    <span class="label">Momentum:</span><span>{(m.momentum * 100):.2f}%</span>
+                    <span class="label">Momentum:</span><span>{momentum_str}</span>
                 </div>
             </div>
         """, unsafe_allow_html=True)
@@ -696,7 +742,7 @@ with left1:
             <div class="prediction-box">
                 <div class="prediction-label">🔮 Predicted Next Price (Calculus)</div>
                 <div class="prediction-value">
-                    ${m.prediction:.2f} {'↗' if m.prediction > last else '↘'} {pred_change:.2f}%
+                    ${m.prediction:.4f} {'↗' if m.prediction > last else '↘'} {pred_change:.2f}%
                 </div>
             </div>
             </div>
@@ -725,7 +771,7 @@ with right1:
                 <span>{order.contracts} contracts</span>
             </div>
             <div class="order-details">
-                {order.market} @ ${order.price:.2f}<br>
+                {order.market} @ ${order.price:.4f}<br>
                 {order.reason}<br>
                 <span style="color:#64748b">{order.timestamp}</span>
             </div>
@@ -733,7 +779,6 @@ with right1:
         """, unsafe_allow_html=True)
     st.markdown('</div></div>', unsafe_allow_html=True)
 
-# Grid 2: stats + equity + performance
 left2, right2 = st.columns([2, 1])
 
 with left2:
@@ -766,7 +811,7 @@ with left2:
         <div class="stat-value">{total_contracts}</div>
     </div>
     <div class="stat-box">
-        <div class="stat-label">Trades</div>
+        <div class="stat-label">Closed Trades</div>
         <div class="stat-value">{perf['total_trades']}</div>
     </div>
     <div class="stat-box">
@@ -775,7 +820,7 @@ with left2:
     </div>
     <div class="stat-box">
         <div class="stat-label">Avg PnL / Trade</div>
-        <div class="stat-value">{perf['avg_pnl']:.0f}</div>
+        <div class="stat-value">{perf['avg_pnl']:.2f}</div>
     </div>
     <div class="stat-box">
         <div class="stat-label">Max Drawdown</div>
@@ -791,5 +836,4 @@ with right2:
 
 st.markdown('</div>', unsafe_allow_html=True)
 
-# Auto-run at the very end
 autorun_engine()
